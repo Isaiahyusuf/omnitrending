@@ -1,7 +1,11 @@
 # main.py
 # Stage 1 OmniTrending Telegram bot (basic UI + CA input + mock token lookup)
 # Requirements: python-telegram-bot, requests, python-dotenv (see requirements.txt)
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 import os
 import logging
 import requests
