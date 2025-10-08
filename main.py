@@ -107,19 +107,31 @@ def format_percentage(num):
     except:
         return "⚪ N/A"
 
-async def resize_image(url, size=(128,128)):
+async def resize_image(url, size=(200,200)):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 img_bytes = await resp.read()
                 img = Image.open(BytesIO(img_bytes))
-                img.thumbnail(size)
+                
+                # Convert to RGB if necessary
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                    img = background
+                
+                # Resize maintaining aspect ratio
+                img.thumbnail(size, Image.Resampling.LANCZOS)
+                
                 bio = BytesIO()
                 bio.name = "logo.png"
-                img.save(bio, format="PNG")
+                img.save(bio, format="PNG", quality=95)
                 bio.seek(0)
                 return bio
-    except:
+    except Exception as e:
+        print(f"Error resizing image: {e}")
         return None
 
 def create_professional_message(pair_data, chain_name):
@@ -341,7 +353,7 @@ async def handle_payment_paid(callback_query: types.CallbackQuery, state: FSMCon
     user_id = callback_query.from_user.id
     user_full_name = callback_query.from_user.full_name or "Unknown"
     
-    # Notify support team
+    # Notify support team with activation button
     if SUPPORT_CHAT:
         try:
             support_notification = (
@@ -356,7 +368,13 @@ async def handle_payment_paid(callback_query: types.CallbackQuery, state: FSMCon
                 f"💰 <b>Amount:</b> {payment_amount} {network.upper()}\n\n"
                 f"<b>⚠️ User clicked PAID - Awaiting TX ID</b>"
             )
-            await bot.send_message(SUPPORT_CHAT, support_notification)
+            
+            # Add activation button for support
+            activate_button = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton("✅ Activate Trending", callback_data=f"activate_{user_id}_{network}_{selected_package}")]
+            ])
+            
+            await bot.send_message(SUPPORT_CHAT, support_notification, reply_markup=activate_button)
         except Exception as e:
             print(f"Could not send notification to support chat: {e}")
     
@@ -371,6 +389,39 @@ async def handle_payment_paid(callback_query: types.CallbackQuery, state: FSMCon
     
     await callback_query.message.answer(user_message)
     await state.finish()
+
+# ---------------- Activate Trending (Support Only) ----------------
+@dp.callback_query_handler(lambda c: c.data.startswith("activate_"))
+async def handle_activate_trending(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    
+    # Parse callback data: activate_{user_id}_{network}_{package}
+    parts = callback_query.data.split("_")
+    if len(parts) >= 4:
+        target_user_id = int(parts[1])
+        network = parts[2]
+        package = parts[3]
+        
+        network_emoji = NETWORK_EMOJIS.get(network, "🔗")
+        
+        # Notify the user that trending is activated
+        try:
+            user_activation_message = (
+                f"🎉 <b>TRENDING ACTIVATED!</b>\n\n"
+                f"{network_emoji} <b>Network:</b> {network.upper()}\n"
+                f"⏰ <b>Duration:</b> {package.upper()}\n\n"
+                f"Your token is now trending! 🚀\n\n"
+                f"Thank you for using OmniTrending!"
+            )
+            await bot.send_message(target_user_id, user_activation_message)
+            
+            # Update support message
+            await callback_query.message.edit_text(
+                callback_query.message.text + f"\n\n✅ <b>ACTIVATED by {callback_query.from_user.full_name}</b>"
+            )
+            
+        except Exception as e:
+            await callback_query.message.answer(f"❌ Error activating trending: {e}")
 
 async def trending_timer(user_id, duration):
     await asyncio.sleep(duration)
