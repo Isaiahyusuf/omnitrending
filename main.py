@@ -62,6 +62,7 @@ dp = Dispatcher(bot, storage=storage)
 class UserState(StatesGroup):
     waiting_for_ca = State()
     waiting_for_trend_package = State()
+    waiting_for_payment = State()
     trending_active = State()
 
 # ---------------- Utils ----------------
@@ -285,7 +286,6 @@ async def handle_trend_package_selection(callback_query: types.CallbackQuery, st
     
     user_data = await state.get_data()
     network = user_data.get("selected_network", "ethereum")
-    contract_address = user_data.get("contract_address", "N/A")
     
     duration_map = {"trend_3h": "3h", "trend_12h": "12h", "trend_24h": "24h"}
     package = callback_query.data
@@ -297,41 +297,76 @@ async def handle_trend_package_selection(callback_query: types.CallbackQuery, st
     amount = packages.get(duration_label, 0)
     
     network_emoji = NETWORK_EMOJIS.get(network, "🔗")
+    
+    # Store selected package info
+    await state.update_data(selected_package=duration_label, payment_amount=amount)
+    
+    # Show payment info to user with "Paid" button
+    payment_message = (
+        f"╔══════════════════════════╗\n"
+        f"     <b>💳 PAYMENT DETAILS</b>\n"
+        f"╚══════════════════════════╝\n\n"
+        f"{network_emoji} <b>Network:</b> {network.upper()}\n"
+        f"⏰ <b>Package:</b> {duration_label.upper()}\n"
+        f"💰 <b>Amount:</b> {amount} {network.upper()}\n\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃  <b>📝 PAYMENT WALLET</b>      ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"<code>{payment_wallet}</code>\n\n"
+        f"<b>📌 Instructions:</b>\n"
+        f"1️⃣ Send <b>{amount} {network.upper()}</b> to the wallet above\n"
+        f"2️⃣ Click the <b>Paid</b> button below when done\n"
+    )
+    
+    paid_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("✅ Paid", callback_data="payment_paid")]
+    ])
+    
+    await callback_query.message.answer(payment_message, reply_markup=paid_button)
+    await UserState.waiting_for_payment.set()
+
+# ---------------- Handle Payment Confirmation ----------------
+@dp.callback_query_handler(lambda c: c.data == "payment_paid", state=UserState.waiting_for_payment)
+async def handle_payment_paid(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    
+    user_data = await state.get_data()
+    network = user_data.get("selected_network", "ethereum")
+    contract_address = user_data.get("contract_address", "N/A")
+    selected_package = user_data.get("selected_package", "3h")
+    payment_amount = user_data.get("payment_amount", 0)
+    
+    network_emoji = NETWORK_EMOJIS.get(network, "🔗")
     username = callback_query.from_user.username or "Unknown"
     user_id = callback_query.from_user.id
     user_full_name = callback_query.from_user.full_name or "Unknown"
     
-    # Send detailed request to support team
+    # Notify support team
     if SUPPORT_CHAT:
         try:
             support_notification = (
                 f"╔══════════════════════════╗\n"
-                f"  <b>🚀 NEW TRENDING REQUEST</b>\n"
+                f"  <b>🚀 PAYMENT CLAIMED</b>\n"
                 f"╚══════════════════════════╝\n\n"
                 f"👤 <b>User:</b> {user_full_name} (@{username})\n"
                 f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
                 f"{network_emoji} <b>Network:</b> {network.upper()}\n"
                 f"📝 <b>Contract:</b> <code>{contract_address}</code>\n"
-                f"⏰ <b>Package:</b> {duration_label.upper()}\n"
-                f"💰 <b>Amount:</b> {amount} {network.upper()}\n\n"
-                f"┏━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
-                f"┃  <b>💳 PAYMENT WALLET</b>     ┃\n"
-                f"┗━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
-                f"<code>{payment_wallet}</code>\n\n"
-                f"<b>⚠️ Awaiting transaction ID from user</b>"
+                f"⏰ <b>Package:</b> {selected_package.upper()}\n"
+                f"💰 <b>Amount:</b> {payment_amount} {network.upper()}\n\n"
+                f"<b>⚠️ User clicked PAID - Awaiting TX ID</b>"
             )
             await bot.send_message(SUPPORT_CHAT, support_notification)
         except Exception as e:
             print(f"Could not send notification to support chat: {e}")
     
-    # Send confirmation to user
+    # Ask user to send TX ID to support
     user_message = (
-        f"✅ <b>Trending Request Submitted!</b>\n\n"
-        f"{network_emoji} <b>Network:</b> {network.upper()}\n"
-        f"⏰ <b>Package:</b> {duration_label.upper()}\n\n"
+        f"✅ <b>Payment Confirmed!</b>\n\n"
         f"📩 <b>Next Step:</b>\n"
-        f"Our support team will contact you with payment details.\n\n"
-        f"💬 <b>Contact Support:</b> @OmniTrendingPortal"
+        f"Please send your <b>Transaction ID (TX ID)</b> to our support team for verification.\n\n"
+        f"💬 <b>Send TX ID to:</b> @OmniTrendingPortal\n\n"
+        f"After verification, your trending will be activated!"
     )
     
     await callback_query.message.answer(user_message)
