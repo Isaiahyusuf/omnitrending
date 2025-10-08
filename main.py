@@ -290,16 +290,40 @@ async def handle_start_trending(callback_query: types.CallbackQuery, state: FSMC
 @dp.callback_query_handler(lambda c: c.data.startswith("trend_"), state=UserState.waiting_for_trend_package)
 async def handle_trend_package_selection(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
-    duration_map = {"trend_3h":3*3600,"trend_12h":12*3600,"trend_24h":24*3600}
+    
+    user_data = await state.get_data()
+    network = user_data.get("selected_network", "ethereum")
+    
+    duration_map = {"trend_3h": "3h", "trend_12h": "12h", "trend_24h": "24h"}
     package = callback_query.data
-    duration = duration_map.get(package,3600)
-    username = callback_query.from_user.username or callback_query.from_user.full_name
-
-    await callback_query.message.answer(f"✅ Trending started for @{username}.\n⏳ Duration: {package[6:]}")
-    await state.update_data(trending_duration=duration)
-
-    # Schedule end notification
-    asyncio.create_task(trending_timer(callback_query.from_user.id, duration))
+    duration_label = duration_map.get(package, "3h")
+    
+    # Get payment info
+    payment_wallet = PAYMENT_WALLETS.get(network, "")
+    packages = TRENDING_PACKAGES.get(network, {})
+    amount = packages.get(duration_label, 0)
+    
+    network_emoji = NETWORK_EMOJIS.get(network, "🔗")
+    
+    payment_message = (
+        f"╔══════════════════════════╗\n"
+        f"     <b>💳 PAYMENT REQUIRED</b>\n"
+        f"╚══════════════════════════╝\n\n"
+        f"{network_emoji} <b>Network:</b> {network.upper()}\n"
+        f"⏰ <b>Package:</b> {duration_label.upper()} Trending\n"
+        f"💰 <b>Amount:</b> {amount} {network.upper()}\n\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃  <b>📝 PAYMENT WALLET</b>      ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"<code>{payment_wallet}</code>\n\n"
+        f"<b>📌 Next Steps:</b>\n"
+        f"1️⃣ Send <b>{amount} {network.upper()}</b> to the wallet above\n"
+        f"2️⃣ After payment, send your <b>Transaction ID</b> to our support\n"
+        f"3️⃣ We'll verify and activate your trending!\n\n"
+        f"💬 <b>Send TX ID to:</b> @OmniTrendingPortal"
+    )
+    
+    await callback_query.message.answer(payment_message)
     await state.finish()
 
 async def trending_timer(user_id, duration):
