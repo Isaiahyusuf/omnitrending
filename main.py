@@ -3,14 +3,14 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# ---------------- BOT TOKEN ----------------
-# ⚠️ Replace 'YOUR_BOT_TOKEN_HERE' with your real Telegram bot token when running the bot
-BOT_TOKEN = "7761935210:AAHWHMUxyjYCMR4wV4doLX3tIfA8MArrN7I"
+# ---------------- Load Bot Token ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Render environment variable
 
-if not BOT_TOKEN or BOT_TOKEN == "7761935210:AAHWHMUxyjYCMR4wV4doLX3tIfA8MArrN7I":
-    raise ValueError("❌ Please set your BOT_TOKEN before running the bot!")
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN environment variable not found! "
+                     "Set it in Render dashboard under Environment Variables.")
 
-# ---------------- Initialize bot and dispatcher ----------------
+# ---------------- Initialize Bot ----------------
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.MARKDOWN_V2)
 dp = Dispatcher(bot)
 
@@ -37,7 +37,7 @@ async def start_command(message: types.Message):
 
     await message.answer(start_text, reply_markup=keyboard)
 
-# ---------------- Network selection handler ----------------
+# ---------------- Network Selection ----------------
 @dp.callback_query_handler(lambda c: c.data.startswith("select_"))
 async def handle_network_selection(callback_query: types.CallbackQuery):
     await callback_query.answer()
@@ -47,7 +47,7 @@ async def handle_network_selection(callback_query: types.CallbackQuery):
         "Now please send the *Contract Address (CA)* of the token you want to track or trend\\."
     )
 
-# ---------------- Support handler ----------------
+# ---------------- Support ----------------
 @dp.callback_query_handler(lambda c: c.data == "support")
 async def handle_support(callback_query: types.CallbackQuery):
     await callback_query.answer()
@@ -83,7 +83,7 @@ async def help_command(message: types.Message):
     )
     await message.answer(help_text)
 
-# ---------------- Run the bot ----------------
+# ---------------- Run the Bot ----------------
 if __name__ == "__main__":
     print("🚀 OmniTrending bot is now running...")
     executor.start_polling(dp, skip_updates=True)
