@@ -2,16 +2,15 @@ import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from dotenv import load_dotenv
 
-# --- Load environment variables ---
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ---------------- BOT TOKEN ----------------
+# ⚠️ Replace 'YOUR_BOT_TOKEN_HERE' with your real Telegram bot token when running the bot
+BOT_TOKEN = "7761935210:AAHWHMUxyjYCMR4wV4doLX3tIfA8MArrN7I"
 
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN environment variable not found!")
+if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    raise ValueError("❌ Please set your BOT_TOKEN before running the bot!")
 
-# --- Initialize bot and dispatcher ---
+# ---------------- Initialize bot and dispatcher ----------------
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.MARKDOWN_V2)
 dp = Dispatcher(bot)
 
@@ -26,7 +25,6 @@ async def start_command(message: types.Message):
         "Choose your network below to get started:"
     )
 
-    # Inline buttons
     buttons = [
         [InlineKeyboardButton("💜 Solana", callback_data="select_sol")],
         [InlineKeyboardButton("💠 Ethereum", callback_data="select_eth")],
@@ -42,7 +40,7 @@ async def start_command(message: types.Message):
 # ---------------- Network selection handler ----------------
 @dp.callback_query_handler(lambda c: c.data.startswith("select_"))
 async def handle_network_selection(callback_query: types.CallbackQuery):
-    await callback_query.answer()  # ✅ Prevent loading icon
+    await callback_query.answer()
     network = callback_query.data.split("_")[1].capitalize()
     await callback_query.message.answer(
         f"✅ You selected *{network}* network\\.\n\n"
