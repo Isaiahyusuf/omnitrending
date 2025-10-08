@@ -107,10 +107,10 @@ def format_percentage(num):
     except:
         return "⚪ N/A"
 
-async def resize_image(url, size=(200,200)):
+async def resize_image(url, size=(300,300)):
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 img_bytes = await resp.read()
                 img = Image.open(BytesIO(img_bytes))
                 
@@ -119,15 +119,24 @@ async def resize_image(url, size=(200,200)):
                     background = Image.new('RGB', img.size, (255, 255, 255))
                     if img.mode == 'P':
                         img = img.convert('RGBA')
-                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                    if img.mode in ('RGBA', 'LA'):
+                        background.paste(img, mask=img.split()[-1])
+                    else:
+                        background.paste(img)
                     img = background
                 
-                # Resize maintaining aspect ratio
-                img.thumbnail(size, Image.Resampling.LANCZOS)
+                # Create square canvas with padding
+                max_dim = max(img.size)
+                square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
+                offset = ((max_dim - img.size[0]) // 2, (max_dim - img.size[1]) // 2)
+                square_img.paste(img, offset)
+                
+                # Resize to target size
+                square_img.thumbnail(size, Image.Resampling.LANCZOS)
                 
                 bio = BytesIO()
                 bio.name = "logo.png"
-                img.save(bio, format="PNG", quality=95)
+                square_img.save(bio, format="PNG", quality=95)
                 bio.seek(0)
                 return bio
     except Exception as e:
@@ -213,6 +222,7 @@ async def start_command(message: types.Message, state: FSMContext):
         [InlineKeyboardButton("🟡 BSC", callback_data="select_bsc")],
         [InlineKeyboardButton("🧊 Base", callback_data="select_base")],
         [InlineKeyboardButton("⚪ Arbitrum", callback_data="select_arbitrum")],
+        [InlineKeyboardButton("💰 Prices", callback_data="show_prices")],
         [InlineKeyboardButton("🛠️ Support", callback_data="support")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -444,6 +454,40 @@ async def handle_main_menu(callback_query: types.CallbackQuery, state: FSMContex
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback_query.message.edit_text(start_text, reply_markup=keyboard)
+
+# ---------------- Show Prices Handler ----------------
+@dp.callback_query_handler(lambda c: c.data == "show_prices", state='*')
+async def handle_show_prices(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    
+    prices_text = (
+        f"╔══════════════════════════╗\n"
+        f"     <b>💰 TRENDING PRICES</b>\n"
+        f"╚══════════════════════════╝\n\n"
+    )
+    
+    for network, emoji in NETWORK_EMOJIS.items():
+        packages = TRENDING_PACKAGES.get(network, {})
+        prices_text += (
+            f"{emoji} <b>{network.upper()}</b>\n"
+            f"├ 3H:  {packages.get('3h', 0)} {network.upper()}\n"
+            f"├ 12H: {packages.get('12h', 0)} {network.upper()}\n"
+            f"└ 24H: {packages.get('24h', 0)} {network.upper()}\n\n"
+        )
+    
+    prices_text += (
+        f"<b>📌 How It Works:</b>\n"
+        f"1️⃣ Select a network and provide token CA\n"
+        f"2️⃣ Choose trending package duration\n"
+        f"3️⃣ Make payment and send TX ID to support\n"
+        f"4️⃣ Your token goes trending! 🚀"
+    )
+    
+    back_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
+    ])
+    
+    await callback_query.message.answer(prices_text, reply_markup=back_button)
 
 # ---------------- Support Handler ----------------
 @dp.callback_query_handler(lambda c: c.data == "support", state='*')
