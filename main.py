@@ -7,7 +7,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 # ⚠️ Replace 'YOUR_BOT_TOKEN_HERE' with your real Telegram bot token when running the bot
 BOT_TOKEN = "7761935210:AAHWHMUxyjYCMR4wV4doLX3tIfA8MArrN7I"
 
-if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+if not BOT_TOKEN or BOT_TOKEN == "7761935210:AAHWHMUxyjYCMR4wV4doLX3tIfA8MArrN7I":
     raise ValueError("❌ Please set your BOT_TOKEN before running the bot!")
 
 # ---------------- Initialize bot and dispatcher ----------------
