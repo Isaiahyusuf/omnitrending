@@ -3,7 +3,6 @@
 #from aiogram import Bot, Dispatcher, types
 #from aiogram.utils import executor
 #from keep_alive import keep_alive  # ✅ place here
-from network_checker import detect_network_from_dexscreener
 import os
 import aiohttp
 import asyncio
@@ -332,18 +331,51 @@ async def fetch_from_pumpportal(token_address: str):
 
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
+
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
+
 async def fetch_from_dexscreener(token_address: str):
+    """Fetch token info from Dexscreener tokens endpoint.
+    Returns the parsed JSON dict or None on failure.
+    """
+    url = DEXSCREENER_TOKEN_URL + token_address
+    headers = {"User-Agent": "OmniTrending/1.0 (+https://example.com)"}
+
     try:
-        url = DEXSCREENER_TOKEN_URL + token_address
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=12) as resp:
+                if resp.status != 200:
+                    print(f"[Dexscreener] tokens API HTTP {resp.status} for {token_address}")
+                    return None
+                data = await resp.json()
+                if not data or "pairs" not in data or not data["pairs"]:
+                    print(f"[Dexscreener] tokens API returned no pairs for {token_address}")
+                    return None
+                return data
+    except Exception as e:
+        print(f"[Dexscreener] fetch error for {token_address}: {e}")
+        return None
+
+
+PUMP_API = "https://pump.fun/api/v1/token/"
+
+async def fetch_from_pumpfun(token_address: str):
+    """Try pump.fun API as a fallback. Returns parsed JSON or None."""
+    url = PUMP_API + token_address
+    headers = {"User-Agent": "OmniTrending/1.0 (+https://example.com)"}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data
+                    if data:
+                        return data
+                else:
+                    print(f"[Pump.fun] HTTP {resp.status} for {token_address}")
+                    return None
     except Exception as e:
-        await send_support_log("ERROR", f"Dexscreener fetch error: {e}", {"token": token_address})
-    return None
+        print(f"[Pump.fun] fetch error for {token_address}: {e}")
+        return None
 
 async def fetch_token_info_auto(chain_id: str, token_address: str):
     """
@@ -1335,25 +1367,45 @@ async def help_command(message: types.Message):
 # ==========================================================
 import re
 
-async def detect_network_from_dexscreener(ca: str):
+
+async def detect_network_from_dexscreener(ca: str, supported_networks=None):
+    """Detect which chain (chainId string) a contract address belongs to using Dexscreener search API.
+    Returns chainId as string (e.g. "ethereum", "bsc", "solana", "base", etc.) or None if not found.
+    Accepts optional supported_networks (list) but will prefer matches in that list if provided.
     """
-    Checks if the provided contract address exists on Dexscreener.
-    Returns the network name if found, else returns None.
-    """
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+    url = f"https://api.dexscreener.com/latest/dex/search/?q={ca}"
+    headers = {"User-Agent": "OmniTrending/1.0 (+https://example.com)"}
+
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=10) as resp:
                 if resp.status != 200:
+                    print(f"[Dexscreener] search API HTTP {resp.status} for {ca}")
                     return None
+
                 data = await resp.json()
-                pairs = data.get("pairs")
+                if not data:
+                    print(f"[Dexscreener] empty search response for {ca}")
+                    return None
+
+                pairs = data.get("pairs") or data.get("results") or []
                 if not pairs:
                     return None
-                # Extract network name from the first valid pair
-                return pairs[0].get("chainId")
+
+                # If supported_networks provided, try to find matching chainId
+                if supported_networks:
+                    for p in pairs:
+                        chain = p.get("chainId")
+                        if chain and chain in supported_networks:
+                            return chain
+
+                # fallback: return the first chainId we see
+                first = pairs[0]
+                chain_id = first.get("chainId")
+                return chain_id
+
     except Exception as e:
-        print(f"[Dexscreener Check Error] {e}")
+        print(f"[Dexscreener] detect_network error for {ca}: {e}")
         return None
 
 
