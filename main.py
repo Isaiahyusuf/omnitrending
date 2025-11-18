@@ -12,6 +12,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from datetime import datetime, timedelta
 import json
+##bot is ready
 
 # ---------------- Load Bot Token ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
