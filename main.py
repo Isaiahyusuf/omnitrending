@@ -1,6 +1,7 @@
 import os
 import aiohttp
 import asyncio
+import logging
 from io import BytesIO
 from PIL import Image
 from aiogram import Bot, Dispatcher, types
@@ -9,13 +10,39 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from datetime import datetime, timedelta
+import json
 
 # ---------------- Load Bot Token ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPPORT_CHAT = os.getenv("SUPPORT_CHAT")  # Telegram chat ID for support (optional)
+
+SUPPORT_CHAT = os.getenv("SUPPORT_CHAT")  # Optional support chat id (string or int)
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN environment variable not found!")
+
+# ---------------- Admin / Channel config ----------------
+SUPPORT_IDS = [8435563121]                   # Allowed support user IDs (will receive debug messages)
+CHANNEL_ID = -1002271758972                 # Channel ID (negative) where posts will be sent
+
+# ---------------- Footer / Branding ----------------
+POST_FOOTER = "\n\n🌐 OmniTrending • visibility for your  token"
+
+# ---------------- Logging setup (console + file) ----------------
+logger = logging.getLogger("omnitrending")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
+
+# Optional rotating file log (uncomment if you want file logs)
+try:
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler("omnitrending.log", maxBytes=2_000_000, backupCount=3)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(file_handler)
+except Exception:
+    pass
 
 # ---------------- Payment Wallets ----------------
 PAYMENT_WALLETS = {
@@ -65,24 +92,102 @@ class UserState(StatesGroup):
     waiting_for_payment = State()
     trending_active = State()
 
-# ---------------- Utils ----------------
-async def fetch_token_info(chain_id: str, token_address: str):
+# ---------------- Runtime session storage ----------------
+# key = session_id (channel message id), value = dict with session details
+TREND_SESSIONS = {}
+
+# Store user-specific contract addresses (temporary in-memory)
+user_contracts = {}
+
+# thresholds to watch (percent)
+THRESHOLDS = [10, 20, 30, 40, 50, 60, 70]
+
+# poll interval in seconds for checking updates (every 3 minutes as requested).
+POLL_INTERVAL = 180
+
+# ---------------- Helpers ----------------
+async def send_support_log(level: str, text: str, extra: dict = None):
+    """Send a short log message to all SUPPORT_IDS and print log to console/file."""
+    timestamp = datetime.utcnow().isoformat()
+    body = f"[{level}] {timestamp}\n{text}"
+    if extra:
+        try:
+            body += "\n\n" + json.dumps(extra, default=str)[:1900]
+        except:
+            pass
+
+    # Send to support IDs (DM)
+    for sid in SUPPORT_IDS:
+        try:
+            await bot.send_message(sid, body, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Could not send support log to {sid}: {e}")
+
+    # Also log locally
+    if level.upper() == "ERROR":
+        logger.error(text)
+    elif level.upper() == "WARN" or level.upper() == "WARNING":
+        logger.warning(text)
+    else:
+        logger.info(text)
+
+# ---------------- Utils (fetch/format/resize) ----------------
+async def fetch_token_info_raw(token_address: str):
+    """
+    Fetch raw dexscreener response for a token address.
+    Returns the JSON or None on failure.
+    """
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if data and 'pairs' in data and len(data['pairs']) > 0:
-                        chain_pairs = [p for p in data['pairs'] if p.get('chainId','').lower() == chain_id.lower()]
-                        if chain_pairs:
-                            pair = max(chain_pairs, key=lambda x: float(x.get('liquidity', {}).get('usd',0) or 0))
-                            return pair
-                        elif data['pairs']:
-                            return data['pairs'][0]
+                    return data
+                else:
+                    return None
     except Exception as e:
-        print(f"Error fetching token info: {e}")
-    return None
+        await send_support_log("ERROR", f"Error fetching token info raw: {e}", {"url": url})
+        return None
+
+async def find_pair_for_chain(raw_data: dict, desired_chain: str):
+    """
+    Given DexScreener raw data, try to find the best pair for desired_chain.
+    Returns the chosen pair dict or None.
+    Also returns set of chains found in raw_data for reporting.
+    """
+    if not raw_data or 'pairs' not in raw_data:
+        return None, set()
+
+    pairs = raw_data.get('pairs', [])
+    found_chains = set()
+    desired_chain_lower = desired_chain.lower() if desired_chain else ""
+    matching_pairs = []
+
+    for p in pairs:
+        # chainId or chain field may store identifiers like 'ethereum' or numeric IDs depending on API.
+        chain_field = (str(p.get('chainId') or p.get('chain') or "")).lower()
+        if chain_field:
+            found_chains.add(chain_field)
+        # consider a match if the chain_field contains the desired_chain string
+        if desired_chain_lower and desired_chain_lower in chain_field:
+            matching_pairs.append(p)
+
+    if matching_pairs:
+        # pick pair with max liquidity usd if available
+        pair = max(matching_pairs, key=lambda x: float((x.get('liquidity', {}).get('usd', 0) or 0)))
+        return pair, found_chains
+
+    # no matching_pair found -> return None but give found_chains for diagnostics
+    return None, found_chains
+
+async def fetch_token_info(chain_id: str, token_address: str):
+    """
+    High-level fetch that returns a pair for the desired chain if available, otherwise None.
+    """
+    raw = await fetch_token_info_raw(token_address)
+    pair, chains = await find_pair_for_chain(raw, chain_id)
+    return pair, chains
 
 def format_number(num):
     try:
@@ -113,7 +218,7 @@ async def resize_image(url, size=(300,300)):
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 img_bytes = await resp.read()
                 img = Image.open(BytesIO(img_bytes))
-                
+
                 # Convert to RGB if necessary
                 if img.mode in ('RGBA', 'LA', 'P'):
                     background = Image.new('RGB', img.size, (255, 255, 255))
@@ -124,23 +229,23 @@ async def resize_image(url, size=(300,300)):
                     else:
                         background.paste(img)
                     img = background
-                
+
                 # Create square canvas with padding
                 max_dim = max(img.size)
                 square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
                 offset = ((max_dim - img.size[0]) // 2, (max_dim - img.size[1]) // 2)
                 square_img.paste(img, offset)
-                
+
                 # Resize to target size
                 square_img.thumbnail(size, Image.Resampling.LANCZOS)
-                
+
                 bio = BytesIO()
                 bio.name = "logo.png"
                 square_img.save(bio, format="PNG", quality=95)
                 bio.seek(0)
                 return bio
     except Exception as e:
-        print(f"Error resizing image: {e}")
+        await send_support_log("ERROR", f"Error resizing image: {e}", {"url": url})
         return None
 
 def create_professional_message(pair_data, chain_name):
@@ -168,7 +273,7 @@ def create_professional_message(pair_data, chain_name):
         else: price_display = f"${price_float:.6f}"
     except: price_display = "N/A"
 
-    network_emoji = NETWORK_EMOJIS.get(pair_chain.lower(),"🔗")
+    network_emoji = NETWORK_EMOJIS.get(str(pair_chain).lower(),"🔗")
 
     message = (
         f"╔══════════════════════════╗\n"
@@ -252,11 +357,27 @@ async def handle_contract_address(message: types.Message, state: FSMContext):
 
     try:
         chain_id = CHAIN_IDS.get(network, network)
-        pair_data = await fetch_token_info(chain_id, ca)
+        pair_data, found_chains = await fetch_token_info(chain_id, ca)
+
+        # Token not found at all
+        if not pair_data:
+            # If dexscreener returned some chains but not the desired one, let the user know
+            if found_chains:
+                found_list = ", ".join(sorted(found_chains))
+                await waiting_msg.edit_text(
+                    f"⚠️ Token found on DexScreener but not for the selected network ({network.upper()}).\n"
+                    f"Detected chains for this CA: {found_list}\n\n"
+                    f"Please check the contract address and network, then try again."
+                )
+            else:
+                await waiting_msg.edit_text("❌ Token not found on DexScreener. Please check the contract address and try again.")
+            return
+
+        # Create the professional message and continue
         logo_url, token_info, chart_url = create_professional_message(pair_data, network)
 
         if not token_info:
-            await waiting_msg.edit_text("❌ <b>Unable to fetch token info.</b>")
+            await waiting_msg.edit_text("❌ <b>Unable to format token info.</b>")
             return
 
         buttons = []
@@ -272,17 +393,20 @@ async def handle_contract_address(message: types.Message, state: FSMContext):
             img = await resize_image(logo_url)
             if img:
                 await waiting_msg.delete()
-                await message.answer_photo(photo=img, caption=token_info, reply_markup=keyboard)
+                await message.answer_photo(photo=img, caption=token_info + POST_FOOTER, reply_markup=keyboard)
             else:
-                await waiting_msg.edit_text(token_info, reply_markup=keyboard)
+                await waiting_msg.edit_text(token_info + POST_FOOTER, reply_markup=keyboard)
         else:
-            await waiting_msg.edit_text(token_info, reply_markup=keyboard)
+            await waiting_msg.edit_text(token_info + POST_FOOTER, reply_markup=keyboard)
 
+        # Save contract for the user session
         await state.update_data(contract_address=ca)
+        user_contracts[message.from_user.id] = ca
         await UserState.waiting_for_trend_package.set()
 
     except Exception as e:
         await waiting_msg.edit_text(f"❌ Error fetching token info: {e}")
+        await send_support_log("ERROR", f"Error in handle_contract_address: {e}", {"ca": ca})
 
 # ---------------- Start Trending Callback ----------------
 @dp.callback_query_handler(lambda c: c.data == "start_trending", state=UserState.waiting_for_trend_package)
@@ -305,24 +429,24 @@ async def handle_start_trending(callback_query: types.CallbackQuery, state: FSMC
 @dp.callback_query_handler(lambda c: c.data.startswith("trend_"), state=UserState.waiting_for_trend_package)
 async def handle_trend_package_selection(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
-    
+
     user_data = await state.get_data()
     network = user_data.get("selected_network", "ethereum")
-    
+
     duration_map = {"trend_3h": "3h", "trend_12h": "12h", "trend_24h": "24h"}
     package = callback_query.data
     duration_label = duration_map.get(package, "3h")
-    
+
     # Get payment info
     payment_wallet = PAYMENT_WALLETS.get(network, "")
     packages = TRENDING_PACKAGES.get(network, {})
     amount = packages.get(duration_label, 0)
-    
+
     network_emoji = NETWORK_EMOJIS.get(network, "🔗")
-    
+
     # Store selected package info
     await state.update_data(selected_package=duration_label, payment_amount=amount)
-    
+
     # Show payment info to user with "Paid" button
     payment_message = (
         f"╔══════════════════════════╗\n"
@@ -339,11 +463,11 @@ async def handle_trend_package_selection(callback_query: types.CallbackQuery, st
         f"1️⃣ Send <b>{amount} {network.upper()}</b> to the wallet above\n"
         f"2️⃣ Click the <b>Paid</b> button below when done\n"
     )
-    
+
     paid_button = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("✅ Paid", callback_data="payment_paid")]
     ])
-    
+
     await callback_query.message.answer(payment_message, reply_markup=paid_button)
     await UserState.waiting_for_payment.set()
 
@@ -351,43 +475,61 @@ async def handle_trend_package_selection(callback_query: types.CallbackQuery, st
 @dp.callback_query_handler(lambda c: c.data == "payment_paid", state=UserState.waiting_for_payment)
 async def handle_payment_paid(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
-    
+
     user_data = await state.get_data()
     network = user_data.get("selected_network", "ethereum")
     contract_address = user_data.get("contract_address", "N/A")
     selected_package = user_data.get("selected_package", "3h")
     payment_amount = user_data.get("payment_amount", 0)
-    
+
     network_emoji = NETWORK_EMOJIS.get(network, "🔗")
     username = callback_query.from_user.username or "Unknown"
     user_id = callback_query.from_user.id
     user_full_name = callback_query.from_user.full_name or "Unknown"
-    
+
     # Notify support team with activation button
-    if SUPPORT_CHAT:
-        try:
-            support_notification = (
-                f"╔══════════════════════════╗\n"
-                f"  <b>🚀 PAYMENT CLAIMED</b>\n"
-                f"╚══════════════════════════╝\n\n"
-                f"👤 <b>User:</b> {user_full_name} (@{username})\n"
-                f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
-                f"{network_emoji} <b>Network:</b> {network.upper()}\n"
-                f"📝 <b>Contract:</b> <code>{contract_address}</code>\n"
-                f"⏰ <b>Package:</b> {selected_package.upper()}\n"
-                f"💰 <b>Amount:</b> {payment_amount} {network.upper()}\n\n"
-                f"<b>⚠️ User clicked PAID - Awaiting TX ID</b>"
-            )
-            
-            # Add activation button for support
-            activate_button = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton("✅ Activate Trending", callback_data=f"activate_{user_id}_{network}_{selected_package}")]
-            ])
-            
-            await bot.send_message(SUPPORT_CHAT, support_notification, reply_markup=activate_button)
-        except Exception as e:
-            print(f"Could not send notification to support chat: {e}")
-    
+    try:
+        support_notification = (
+            f"╔══════════════════════════╗\n"
+            f"  <b>🚀 PAYMENT CLAIMED</b>\n"
+            f"╚══════════════════════════╝\n\n"
+            f"👤 <b>User:</b> {user_full_name} (@{username})\n"
+            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
+            f"{network_emoji} <b>Network:</b> {network.upper()}\n"
+            f"📝 <b>Contract:</b> <code>{contract_address}</code>\n"
+            f"⏰ <b>Package:</b> {selected_package.upper()}\n"
+            f"💰 <b>Amount:</b> {payment_amount} {network.upper()}\n\n"
+            f"<b>⚠️ User clicked PAID - Awaiting TX ID</b>"
+        )
+
+        # Add activation & reject buttons for support
+        activate_button = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton("✅ Activate Trending", callback_data=f"activate_{user_id}_{network}_{selected_package}"),
+                InlineKeyboardButton("❌ Reject Payment", callback_data=f"reject_{user_id}_{network}_{selected_package}")
+            ]
+        ])
+
+        # Send to optional support chat if provided, else to first SUPPORT_ID
+        if SUPPORT_CHAT:
+            try:
+                await bot.send_message(int(SUPPORT_CHAT), support_notification, reply_markup=activate_button)
+            except Exception as e:
+                logger.warning("Failed to send support notification to SUPPORT_CHAT: %s", e)
+                for sid in SUPPORT_IDS:
+                    try:
+                        await bot.send_message(sid, support_notification, reply_markup=activate_button)
+                    except:
+                        pass
+        else:
+            for sid in SUPPORT_IDS:
+                try:
+                    await bot.send_message(sid, support_notification, reply_markup=activate_button)
+                except Exception as e:
+                    logger.warning("Could not send notification to support %s: %s", sid, e)
+    except Exception as e:
+        logger.exception("Error preparing support notification: %s", e)
+
     # Ask user to send TX ID to support
     user_message = (
         f"✅ <b>Payment Confirmed!</b>\n\n"
@@ -396,48 +538,377 @@ async def handle_payment_paid(callback_query: types.CallbackQuery, state: FSMCon
         f"💬 <b>Send TX ID to:</b> @OmniTrendingPortal\n\n"
         f"After verification, your trending will be activated!"
     )
-    
+
     await callback_query.message.answer(user_message)
     await state.finish()
+
+# ---------------- Reject Payment (Support Only) ----------------
+@dp.callback_query_handler(lambda c: c.data.startswith("reject_"))
+async def handle_reject_payment(callback_query: types.CallbackQuery):
+    """Support-only rejection: notify user and cancel pending data."""
+    if callback_query.from_user.id not in SUPPORT_IDS:
+        await callback_query.answer("🚫 You are not authorized to reject payments.", show_alert=True)
+        return
+
+    await callback_query.answer()
+    parts = callback_query.data.split("_")
+    if len(parts) < 4:
+        await callback_query.message.answer("❌ Invalid reject data.")
+        return
+
+    try:
+        target_user_id = int(parts[1])
+    except Exception as e:
+        await callback_query.message.answer(f"❌ Failed to parse reject data: {e}")
+        return
+
+    # notify user
+    try:
+        await bot.send_message(target_user_id, "❌ Your payment was not approved by support. Please contact support for assistance.")
+    except:
+        pass
+
+    # update support message to reflect rejection
+    try:
+        await callback_query.message.edit_text(callback_query.message.text + f"\n\n❌ <b>Rejected by {callback_query.from_user.full_name}</b>")
+    except:
+        pass
+
+    await send_support_log("INFO", f"Payment rejected for user {target_user_id}", {"by": callback_query.from_user.id})
 
 # ---------------- Activate Trending (Support Only) ----------------
 @dp.callback_query_handler(lambda c: c.data.startswith("activate_"))
 async def handle_activate_trending(callback_query: types.CallbackQuery):
+    """Support-only activation: create channel post, start monitor task."""
+    # authorize
+    if callback_query.from_user.id not in SUPPORT_IDS:
+        await callback_query.answer("🚫 You are not authorized to activate trends.", show_alert=True)
+        return
+
     await callback_query.answer()
-    
+
     # Parse callback data: activate_{user_id}_{network}_{package}
     parts = callback_query.data.split("_")
-    if len(parts) >= 4:
+    if len(parts) < 4:
+        await callback_query.message.answer("❌ Invalid activation data.")
+        return
+
+    try:
         target_user_id = int(parts[1])
         network = parts[2]
-        package = parts[3]
-        
-        network_emoji = NETWORK_EMOJIS.get(network, "🔗")
-        
-        # Notify the user that trending is activated
+        package = parts[3]  # e.g., "3h", "12h", "24h"
+    except Exception as e:
+        await callback_query.message.answer(f"❌ Failed to parse activation data: {e}")
+        return
+
+    # Determine duration
+    # Uses your existing mapping semantics (hours). Adjust if you change package keys.
+    duration_map = {"3h": 3, "12h": 12, "24h": 24}
+    hours = duration_map.get(package.lower(), 3)
+    duration = timedelta(hours=hours)
+    end_time = datetime.utcnow() + duration
+
+    # Recover contract address from user's FSM storage
+    async with dp.current_state(user=target_user_id).proxy() as user_data:
+        contract_address = user_data.get("contract_address")
+
+    if not contract_address:
+        # fallback to in-memory dict if present
+        contract_address = user_contracts.get(target_user_id)
+
+    if not contract_address:
+        await callback_query.message.answer("❌ No contract address found for this user (they must analyze a token first).")
+        return
+
+    # Fetch initial token info (validate again)
+    pair_data, _ = await fetch_token_info(CHAIN_IDS.get(network, network), contract_address)
+    if not pair_data:
+        await callback_query.message.answer("❌ Could not fetch token info from DexScreener.")
+        return
+
+    logo_url, token_info, chart_url = create_professional_message(pair_data, network)
+
+    # baseline price (float)
+    try:
+        baseline = float(pair_data.get('priceUsd') or pair_data.get('price') or 0)
+    except:
+        baseline = 0.0
+
+    # Compose the "Trending Started" header message text
+    base_token = pair_data.get('baseToken', {})
+    symbol = base_token.get('symbol', 'TOKEN')
+    started_text = (
+        f"🔥 <b>TRENDING STARTED FOR {symbol}</b>\n\n"
+        f"🪙 <b>Contract:</b> <code>{contract_address}</code>\n"
+        f"🌐 <b>Network:</b> {network.upper()}\n"
+        f"⏰ <b>Duration:</b> {package.upper()}\n"
+        f"💵 <b>Baseline Price:</b> ${baseline}\n\n"
+        f"📈 Tracking price action and alerting for new highs and dumps (±10%..±70%)."
+        f"{POST_FOOTER}"
+    )
+
+    # Prepare channel post buttons
+    buttons = []
+    if chart_url:
+        buttons.append([InlineKeyboardButton("📊 View Chart", url=chart_url)])
+    buttons.append([InlineKeyboardButton("🌐 OmniTrending • 100K Monthly Subscribers", url="https://t.me/OmniTrendingPortal")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    # Post to channel (photo if logo available)
+    try:
+        if logo_url:
+            img = await resize_image(logo_url)
+            if img:
+                channel_msg = await bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=img,
+                    caption=started_text,
+                    reply_markup=keyboard
+                )
+            else:
+                channel_msg = await bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=started_text,
+                    reply_markup=keyboard
+                )
+        else:
+            channel_msg = await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=started_text,
+                reply_markup=keyboard
+            )
+
+        # Try to pin the message in the channel (requires bot admin)
         try:
-            user_activation_message = (
-                f"🎉 <b>TRENDING ACTIVATED!</b>\n\n"
-                f"{network_emoji} <b>Network:</b> {network.upper()}\n"
-                f"⏰ <b>Duration:</b> {package.upper()}\n\n"
-                f"Your token is now trending! 🚀\n\n"
-                f"Thank you for using OmniTrending!"
-            )
-            await bot.send_message(target_user_id, user_activation_message)
-            
-            # Update support message
-            await callback_query.message.edit_text(
-                callback_query.message.text + f"\n\n✅ <b>ACTIVATED by {callback_query.from_user.full_name}</b>"
-            )
-            
+            await bot.pin_chat_message(CHANNEL_ID, channel_msg.message_id, disable_notification=True)
         except Exception as e:
-            await callback_query.message.answer(f"❌ Error activating trending: {e}")
+            logger.info("Pin attempt failed: %s", e)
 
-async def trending_timer(user_id, duration):
-    await asyncio.sleep(duration)
-    await bot.send_message(user_id, "⏰ Your trending period has ended. Thank you for using OmniTrending!")
+    except Exception as e:
+        await callback_query.message.answer(f"❌ Failed to post to channel: {e}")
+        await send_support_log("ERROR", f"Failed to post trending started: {e}", {"contract": contract_address})
+        return
 
-# ---------------- Main Menu ----------------
+    # Build session and store it
+    session = {
+        "user_id": target_user_id,
+        "network": network,
+        "contract": contract_address,
+        "baseline": baseline,
+        "start_time": datetime.utcnow(),
+        "end_time": end_time,
+        "channel_message": {"chat_id": CHANNEL_ID, "message_id": channel_msg.message_id, "is_photo": bool(logo_url)},
+        "chart_url": chart_url,
+        "logo_url": logo_url,
+        "thresholds_triggered": set(),  # e.g., "high_10", "dump_20"
+        "active": True
+    }
+    TREND_SESSIONS[channel_msg.message_id] = session
+
+    # Notify user
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"🎉 <b>TRENDING ACTIVATED!</b>\n\n"
+            f"{NETWORK_EMOJIS.get(network, '')} <b>Network:</b> {network.upper()}\n"
+            f"⏰ <b>Duration:</b> {package.upper()}\n\n"
+            f"Your token is now live on the OmniTrending Channel! 🚀"
+        )
+    except Exception as e:
+        logger.warning("Failed to notify target user: %s", e)
+
+    # Log to support (activation)
+    await send_support_log("INFO", f"Activated trending for {symbol}", {
+        "user_id": target_user_id,
+        "contract": contract_address,
+        "network": network,
+        "baseline": baseline,
+        "channel_message_id": channel_msg.message_id
+    })
+
+    # Update support UI message text for admin in the activation button message
+    try:
+        await callback_query.message.edit_text(
+            callback_query.message.text + f"\n\n✅ <b>Activated by {callback_query.from_user.full_name}</b>"
+        )
+    except:
+        pass
+
+    # Start background monitor task
+    asyncio.create_task(monitor_trending_session(channel_msg.message_id))
+
+async def monitor_trending_session(session_msg_id):
+    """Monitor one trending session until end_time; post alerts only when thresholds crossed."""
+    session = TREND_SESSIONS.get(session_msg_id)
+    if not session:
+        return
+
+    try:
+        while session["active"] and datetime.utcnow() < session["end_time"]:
+            # Fetch latest data
+            pair_data, _ = await fetch_token_info(CHAIN_IDS.get(session["network"], session["network"]), session["contract"])
+            if pair_data:
+                logo_url, token_info, chart_url = create_professional_message(pair_data, session["network"])
+
+                # compute price and percent change vs baseline
+                try:
+                    current_price = float(pair_data.get('priceUsd') or pair_data.get('price') or 0.0)
+                except:
+                    current_price = 0.0
+
+                baseline = float(session.get("baseline") or 0.0)
+                pct_change = 0.0
+                if baseline and current_price:
+                    pct_change = ((current_price - baseline) / baseline) * 100.0
+
+                # Prepare updated pinned message caption/text
+                caption_extra = f"\n\n<b>Baseline:</b> {baseline}\n<b>Current:</b> {current_price}\n<b>Change:</b> {pct_change:.2f}%"
+                caption_with_footer = f"{token_info}{caption_extra}{POST_FOOTER}"
+
+                # edit the main channel post
+                try:
+                    if session["channel_message"]["is_photo"]:
+                        await bot.edit_message_caption(
+                            chat_id=session["channel_message"]["chat_id"],
+                            message_id=session["channel_message"]["message_id"],
+                            caption=caption_with_footer,
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton("📊 View Chart", url=session.get("chart_url") or chart_url)]
+                            ]) if (session.get("chart_url") or chart_url) else None
+                        )
+                    else:
+                        await bot.edit_message_text(
+                            chat_id=session["channel_message"]["chat_id"],
+                            message_id=session["channel_message"]["message_id"],
+                            text=caption_with_footer,
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton("📊 View Chart", url=session.get("chart_url") or chart_url)]
+                            ]) if (session.get("chart_url") or chart_url) else None
+                        )
+                except Exception as e:
+                    logger.debug("Failed to edit channel message: %s", e)
+
+                # Send debug update to support (every poll)
+                await send_support_log("DEBUG", f"Update for {pair_data.get('baseToken',{}).get('symbol','TOKEN')}: price={current_price}, change={pct_change:.2f}%", {
+                    "contract": session["contract"],
+                    "network": session["network"],
+                    "current_price": current_price,
+                    "pct_change": pct_change,
+                    "time": datetime.utcnow().isoformat()
+                })
+
+                # Check thresholds for highs and dumps (10..70)
+                # For highs
+                for th in THRESHOLDS:
+                    key = f"high_{th}"
+                    if key not in session["thresholds_triggered"]:
+                        if pct_change >= th:
+                            session["thresholds_triggered"].add(key)
+                            await post_threshold_alert(session, pair_data, current_price, pct_change, th, is_high=True)
+
+                # For dumps (negative)
+                for th in THRESHOLDS:
+                    key = f"dump_{th}"
+                    if key not in session["thresholds_triggered"]:
+                        if pct_change <= -th:
+                            session["thresholds_triggered"].add(key)
+                            await post_threshold_alert(session, pair_data, current_price, pct_change, th, is_high=False)
+
+            # small sleep between polls
+            await asyncio.sleep(POLL_INTERVAL)
+
+        # session ended
+        session["active"] = False
+        # notify user and support
+        try:
+            await bot.send_message(
+                session["user_id"],
+                "✅ <b>TRENDING COMPLETED!</b>\n\nYour token's trending session has ended. Thanks for using OmniTrending! 🚀"
+            )
+        except Exception as e:
+            logger.warning("Failed to notify user about completion: %s", e)
+
+        # post "Trending Completed" to channel
+        try:
+            end_text = (
+                f"✅ <b>TRENDING ENDED FOR {session['contract']}</b>\n\n"
+                f"Thanks for using OmniTrending!\n"
+                f"{POST_FOOTER}"
+            )
+            await bot.send_message(session["channel_message"]["chat_id"], end_text)
+        except Exception as e:
+            logger.debug("Failed to send trending completed to channel: %s", e)
+
+        # notify support(s)
+        complete_msg = {
+            "event": "Trending Completed",
+            "user_id": session['user_id'],
+            "contract": session['contract'],
+            "network": session['network'],
+            "started": str(session['start_time']),
+            "ended": str(session['end_time'])
+        }
+        await send_support_log("INFO", "Trending session completed", complete_msg)
+
+    except Exception as e:
+        await send_support_log("ERROR", f"Error in monitor_trending_session: {e}", {"session_id": session_msg_id})
+    finally:
+        # cleanup session entry
+        if session_msg_id in TREND_SESSIONS:
+            del TREND_SESSIONS[session_msg_id]
+
+async def post_threshold_alert(session, pair_data, current_price, pct_change, threshold, is_high=True):
+    """Post an alert to the channel with logo + stats when a threshold is crossed."""
+    symbol = pair_data.get('baseToken',{}).get('symbol', 'TOKEN')
+    name = pair_data.get('baseToken',{}).get('name', '')
+    chart_url = session.get("chart_url") or (pair_data.get('pairAddress') and f"https://dexscreener.com/{pair_data.get('chainId')}/{pair_data.get('pairAddress')}")
+    logo_url = session.get("logo_url") or pair_data.get('info',{}).get('imageUrl') or pair_data.get('baseToken',{}).get('imageUrl')
+
+    if is_high:
+        title = f"🚀 NEW HIGH +{pct_change:.2f}% on {symbol} (≥ +{threshold}%)"
+    else:
+        title = f"💥 BIG DUMP {pct_change:.2f}% on {symbol} (≤ -{threshold}%)"
+
+    # Build alert message
+    msg_text = (
+        f"{title}\n\n"
+        f"<b>{symbol}</b> • {name}\n"
+        f"💵 <b>Price:</b> ${current_price:.8f}\n"
+        f"📈 <b>Change vs baseline:</b> {pct_change:.2f}%\n"
+    )
+    if pair_data.get('liquidity',{}):
+        msg_text += f"🌊 <b>Liquidity:</b> {format_number(pair_data.get('liquidity',{}).get('usd',0))}\n"
+    if pair_data.get('volume',{}):
+        msg_text += f"📊 <b>24h Volume:</b> {format_number(pair_data.get('volume',{}).get('h24',0))}\n"
+    if chart_url:
+        msg_text += f"\n📊 <a href='{chart_url}'>View chart on DexScreener</a>"
+
+    # include powered by footer
+    msg_text += f"\n\n🌐 <b>Powered by OmniTrending</b>{POST_FOOTER}"
+
+    # send photo alert if logo exists
+    try:
+        if logo_url:
+            img = await resize_image(logo_url)
+            if img:
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=img, caption=msg_text, parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=CHANNEL_ID, text=msg_text, parse_mode="HTML")
+        else:
+            await bot.send_message(chat_id=CHANNEL_ID, text=msg_text, parse_mode="HTML")
+
+        # send debug copy to support about this alert
+        await send_support_log("ALERT", f"{'HIGH' if is_high else 'DUMP'} triggered for {symbol}", {
+            "contract": session["contract"],
+            "threshold": threshold,
+            "pct_change": pct_change,
+            "current_price": current_price
+        })
+
+    except Exception as e:
+        await send_support_log("ERROR", f"Failed to send threshold alert: {e}", {"contract": session.get("contract")})
+
+# ---------------- Main Menu & other handlers (unchanged) ----------------
 @dp.callback_query_handler(lambda c: c.data == "main_menu", state='*')
 async def handle_main_menu(callback_query: types.CallbackQuery, state: FSMContext):
     await state.finish()
@@ -453,19 +924,21 @@ async def handle_main_menu(callback_query: types.CallbackQuery, state: FSMContex
         [InlineKeyboardButton("🛠️ Support", callback_data="support")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback_query.message.edit_text(start_text, reply_markup=keyboard)
+    try:
+        await callback_query.message.edit_text(start_text, reply_markup=keyboard)
+    except:
+        await callback_query.message.answer(start_text, reply_markup=keyboard)
 
-# ---------------- Show Prices Handler ----------------
 @dp.callback_query_handler(lambda c: c.data == "show_prices", state='*')
 async def handle_show_prices(callback_query: types.CallbackQuery):
     await callback_query.answer()
-    
+
     prices_text = (
         f"╔══════════════════════════╗\n"
         f"     <b>💰 TRENDING PRICES</b>\n"
         f"╚══════════════════════════╝\n\n"
     )
-    
+
     for network, emoji in NETWORK_EMOJIS.items():
         packages = TRENDING_PACKAGES.get(network, {})
         prices_text += (
@@ -474,7 +947,7 @@ async def handle_show_prices(callback_query: types.CallbackQuery):
             f"├ 12H: {packages.get('12h', 0)} {network.upper()}\n"
             f"└ 24H: {packages.get('24h', 0)} {network.upper()}\n\n"
         )
-    
+
     prices_text += (
         f"<b>📌 How It Works:</b>\n"
         f"1️⃣ Select a network and provide token CA\n"
@@ -482,14 +955,13 @@ async def handle_show_prices(callback_query: types.CallbackQuery):
         f"3️⃣ Make payment and send TX ID to support\n"
         f"4️⃣ Your token goes trending! 🚀"
     )
-    
+
     back_button = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
     ])
-    
+
     await callback_query.message.answer(prices_text, reply_markup=back_button)
 
-# ---------------- Support Handler ----------------
 @dp.callback_query_handler(lambda c: c.data == "support", state='*')
 async def handle_support(callback_query: types.CallbackQuery):
     await callback_query.answer()
@@ -504,11 +976,12 @@ async def handle_support(callback_query: types.CallbackQuery):
 # ---------------- Run Bot ----------------
 async def on_startup(dp):
     commands = [
-        types.BotCommand(command="start", description="🏠 Start the bot"),
-        types.BotCommand(command="help", description="📘 How to use the bot")
+        types.BotCommand(command="/start", description="🏠 Start the bot"),
+        types.BotCommand(command="/help", description="📘 How to use the bot")
     ]
     await bot.set_my_commands(commands)
-    print("🚀 OmniTrending bot is now running...")
+    logger.info("🚀 OmniTrending bot is now running...")
+    await send_support_log("INFO", "Bot started", {"time": datetime.utcnow().isoformat()})
 
 @dp.message_handler(commands=['help'], state='*')
 async def help_command(message: types.Message):
