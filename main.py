@@ -47,9 +47,9 @@ except Exception:
 
 # ---------------- Payment Wallets ----------------
 PAYMENT_WALLETS = {
-    "solana": "BUBMVmvrUVGmN29jFiKEJopjdKFPifSew3cDT1CB5Xah",
-    "ethereum": "0xbc0F786476d68dfC99FCd20D58F887b97fEa7204",
-    "base": "0xbc0F786476d68dfC99FCd20D58F887b97fEa7204",
+    "solana": "CetqZ4pGqdzNua7uqJNVYMor45YXWWkmuugtGVunqJrx",
+    "ethereum": "0x211a4cD86EDf872cC6DD90AA9475460aDF8D8890",
+    "base": "0x211a4cD86EDf872cC6DD90AA9475460aDF8D8890",
     "bsc": "0xdbf228F9B48dccf2099CA0f824073D9B69a23914",
     "arbitrum": "0xdbf228F9B48dccf2099CA0f824073D9B69a23914"
 }
